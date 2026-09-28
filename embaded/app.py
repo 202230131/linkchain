@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from sqlalchemy import Column, DateTime, ForeignKey, Integer, String, Text, create_engine, func
 from sqlalchemy.orm import declarative_base, sessionmaker
@@ -12,10 +13,24 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 from embaded.main import generate_chat_response, normalize_gemini_reply, search_text
 from embaded.mcp import build_mcp_response
 
-DB_URL = "postgresql://postgres:8888@localhost:5432/gemini_docs_3072"
+def get_allowed_origins() -> list[str]:
+    raw = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000,http://localhost:8000,http://127.0.0.1:8000")
+    return [origin.strip() for origin in raw.split(",") if origin.strip()]
+
+
+DB_URL = os.getenv("DATABASE_URL") or "postgresql://postgres:8888@localhost:5432/gemini_docs_3072"
 engine = create_engine(DB_URL, future=True)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 Base = declarative_base()
+
+app = FastAPI(title="LinkChain Personal Assistant")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=get_allowed_origins(),
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 class User(Base):
@@ -48,8 +63,6 @@ class ChatMessage(Base):
 
 
 Base.metadata.create_all(bind=engine)
-
-app = FastAPI(title="LinkChain Personal Assistant")
 
 
 def get_db():

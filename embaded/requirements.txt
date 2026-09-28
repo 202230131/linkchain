@@ -1,6 +1,8 @@
 python-dotenv
 google-genai
 langchain
+langchain-google-genai
 langchain-postgres
+psycopg[binary]
 fastapi
 uvicorn

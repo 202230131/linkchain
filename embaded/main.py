@@ -14,8 +14,37 @@ api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 if not api_key:
     raise RuntimeError("GEMINI_API_KEY 또는 GOOGLE_API_KEY가 설정되지 않았습니다. .env를 확인하세요.")
 
+
+def get_database_url(db_name: str | None = None) -> str:
+    env_url = os.getenv("DATABASE_URL")
+    if env_url:
+        return env_url
+
+    db_name = db_name or os.getenv("PGVECTOR_DB", "gemini_docs_3072")
+    db_user = os.getenv("PGVECTOR_USER", "postgres")
+    db_password = os.getenv("PGVECTOR_PASSWORD", "8888")
+    db_host = os.getenv("PGVECTOR_HOST", "localhost")
+    db_port = os.getenv("PGVECTOR_PORT", "5432")
+    return f"postgresql://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
+
+
+def get_admin_database_url() -> str:
+    admin_url = os.getenv("POSTGRES_ADMIN_URL")
+    if admin_url:
+        return admin_url
+
+    env_url = os.getenv("DATABASE_URL")
+    if env_url:
+        if env_url.rstrip("/").endswith("/postgres"):
+            return env_url
+        base = env_url.rsplit("/", 1)[0]
+        return f"{base}/postgres"
+
+    return "postgresql://postgres:8888@localhost:5432/postgres"
+
+
 def ensure_database_exists(db_name: str) -> None:
-    admin_connection = "postgresql://postgres:8888@localhost:5432/postgres"
+    admin_connection = get_admin_database_url()
     with psycopg.connect(admin_connection) as conn:
         conn.autocommit = True
         with conn.cursor() as cur:
@@ -28,7 +57,7 @@ def ensure_database_exists(db_name: str) -> None:
 
 
 def reset_stale_vector_tables(db_name: str) -> None:
-    conn_str = f"postgresql://postgres:8888@localhost:5432/{db_name}"
+    conn_str = get_database_url(db_name)
     with psycopg.connect(conn_str) as conn:
         conn.autocommit = True
         with conn.cursor() as cur:
@@ -47,7 +76,7 @@ def get_vector_store() -> PGVector:
     ensure_database_exists(db_name)
     if os.getenv("RESET_VECTOR_STORE", "true").lower() == "true":
         reset_stale_vector_tables(db_name)
-    connection_string = f"postgresql://postgres:8888@localhost:5432/{db_name}"
+    connection_string = get_database_url(db_name)
 
     return PGVector(
         embeddings=embeddings,
