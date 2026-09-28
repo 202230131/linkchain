@@ -13,8 +13,9 @@
         .reservation-item { background: rgba(255,255,255,0.08); border-radius: 8px; padding: 12px; margin-bottom: 10px; }
         .reservation-item strong { display: block; margin-bottom: 6px; }
         .reservation-meta { font-size: 12px; color: #d1d5db; margin-top: 6px; }
-        .reservation-actions { display: flex; gap: 8px; margin-top: 8px; }
+        .reservation-actions { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
         .reservation-actions button { padding: 6px 8px; font-size: 12px; }
+        .reservation-actions .like-button.liked { background: #f59e0b; color: #111827; }
         .main { flex: 1; padding: 20px; }
         .auth-box, .dashboard-box { max-width: 980px; margin: 0 auto; }
         .auth-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
@@ -192,69 +193,96 @@
 
         async function loadReservations() {
             try {
-                const response = await fetch('/reservations', { credentials: 'same-origin' });
+                const response = await fetch('/reservations/recommendations', { credentials: 'same-origin' });
                 if (!response.ok) {
+                    const fallback = await fetch('/reservations', { credentials: 'same-origin' });
+                    if (!fallback.ok) return;
+                    const fallbackData = await fallback.json();
+                    window.__reservationData = fallbackData.reservations || [];
+                    renderReservationList(window.__reservationData);
                     return;
                 }
+
                 const data = await response.json();
                 window.__reservationData = data.reservations || [];
-                reservationList.innerHTML = '';
-                if (!data.reservations || data.reservations.length === 0) {
-                    reservationList.innerHTML = '<li class="reservation-item">예약이 없습니다.</li>';
-                    return;
-                }
-
-                data.reservations.forEach((item) => {
-                    const li = document.createElement('li');
-                    li.className = 'reservation-item';
-                    const dt = new Date(item.reservation_datetime);
-                    li.innerHTML = `
-                        <strong>${item.title}</strong>
-                        <div>${dt.toLocaleString('ko-KR')}</div>
-                        <div class="reservation-meta" data-id="${item.id}">상태: ${item.status} · ${formatCountdown(item.reservation_datetime)}</div>
-                        <div class="reservation-actions">
-                            <button type="button" data-action="edit" data-id="${item.id}">수정</button>
-                            <button type="button" data-action="delete" data-id="${item.id}">삭제</button>
-                        </div>
-                    `;
-                    reservationList.appendChild(li);
-                });
-
-                reservationList.querySelectorAll('[data-action="edit"]').forEach((button) => {
-                    button.addEventListener('click', async () => {
-                        const id = Number(button.dataset.id);
-                        const target = (window.__reservationData || []).find((item) => item.id === id);
-                        if (!target) return;
-
-                        const form = document.getElementById('reservationForm');
-                        const formElements = form.elements;
-                        const dt = new Date(target.reservation_datetime);
-                        formElements.namedItem('title').value = target.title;
-                        formElements.namedItem('note').value = target.note || '';
-                        formElements.namedItem('date').value = dt.toISOString().slice(0, 10);
-                        formElements.namedItem('time').value = dt.toTimeString().slice(0, 5);
-                        currentEditReservationId = id;
-                        form.querySelector('button[type="submit"]').textContent = '수정 완료';
-                    });
-                });
-
-                reservationList.querySelectorAll('[data-action="delete"]').forEach((button) => {
-                    button.addEventListener('click', async () => {
-                        const id = Number(button.dataset.id);
-                        const response = await fetch(`/reservations/${id}`, {
-                            method: 'DELETE',
-                            credentials: 'same-origin'
-                        });
-                        if (response.ok) {
-                            loadReservations();
-                        }
-                    });
-                });
-
+                renderReservationList(window.__reservationData);
                 refreshCountdowns();
             } catch (error) {
                 console.error(error);
             }
+        }
+
+        function renderReservationList(items) {
+            reservationList.innerHTML = '';
+            if (!items || items.length === 0) {
+                reservationList.innerHTML = '<li class="reservation-item">예약이 없습니다.</li>';
+                return;
+            }
+
+            items.forEach((item) => {
+                const li = document.createElement('li');
+                li.className = 'reservation-item';
+                const dt = new Date(item.reservation_datetime);
+                const scoreText = typeof item.score === 'number' ? ` · 추천도 ${item.score.toFixed(2)}` : '';
+                const likeButtonText = item.liked ? '좋아요 취소' : '좋아요';
+                li.innerHTML = `
+                    <strong>${item.title}</strong>
+                    <div>${dt.toLocaleString('ko-KR')}</div>
+                    <div class="reservation-meta" data-id="${item.id}">상태: ${item.status || 'pending'} · ${formatCountdown(item.reservation_datetime)}${scoreText}</div>
+                    <div class="reservation-actions">
+                        <button type="button" class="like-button ${item.liked ? 'liked' : ''}" data-action="like" data-id="${item.id}">${likeButtonText}</button>
+                        <button type="button" data-action="edit" data-id="${item.id}">수정</button>
+                        <button type="button" data-action="delete" data-id="${item.id}">삭제</button>
+                    </div>
+                `;
+                reservationList.appendChild(li);
+            });
+
+            reservationList.querySelectorAll('[data-action="edit"]').forEach((button) => {
+                button.addEventListener('click', async () => {
+                    const id = Number(button.dataset.id);
+                    const target = (window.__reservationData || []).find((item) => item.id === id);
+                    if (!target) return;
+
+                    const form = document.getElementById('reservationForm');
+                    const formElements = form.elements;
+                    const dt = new Date(target.reservation_datetime);
+                    formElements.namedItem('title').value = target.title;
+                    formElements.namedItem('note').value = target.note || '';
+                    formElements.namedItem('date').value = dt.toISOString().slice(0, 10);
+                    formElements.namedItem('time').value = dt.toTimeString().slice(0, 5);
+                    currentEditReservationId = id;
+                    form.querySelector('button[type="submit"]').textContent = '수정 완료';
+                });
+            });
+
+            reservationList.querySelectorAll('[data-action="delete"]').forEach((button) => {
+                button.addEventListener('click', async () => {
+                    const id = Number(button.dataset.id);
+                    const response = await fetch(`/reservations/${id}`, {
+                        method: 'DELETE',
+                        credentials: 'same-origin'
+                    });
+                    if (response.ok) {
+                        loadReservations();
+                    }
+                });
+            });
+
+            reservationList.querySelectorAll('[data-action="like"]').forEach((button) => {
+                button.addEventListener('click', async () => {
+                    const id = Number(button.dataset.id);
+                    const isLiked = button.classList.contains('liked');
+                    const url = `/reservations/${id}/like`;
+                    const response = await fetch(url, {
+                        method: isLiked ? 'DELETE' : 'POST',
+                        credentials: 'same-origin'
+                    });
+                    if (response.ok) {
+                        loadReservations();
+                    }
+                });
+            });
         }
 
         document.getElementById('signupForm').addEventListener('submit', async (event) => {

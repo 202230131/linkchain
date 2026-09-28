@@ -1,4 +1,5 @@
 import hashlib
+import json
 import os
 import re
 from datetime import datetime, timedelta
@@ -6,12 +7,21 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
-from sqlalchemy import Column, DateTime, ForeignKey, Integer, String, Text, create_engine, func
+from fastapi.responses import HTMLResponse, RedirectResponse
+from sqlalchemy import Column, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, create_engine, func
 from sqlalchemy.orm import declarative_base, sessionmaker
 
+from embaded.algorithm import rank_reservations_for_user
 from embaded.main import generate_chat_response, normalize_gemini_reply, search_text
-from embaded.mcp import build_mcp_response
+from embaded.mcp import (
+    build_mcp_response,
+    gmail_get_message,
+    gmail_list_recent,
+    google_drive_list,
+    google_drive_search,
+    google_search,
+    google_tools_status,
+)
 
 def get_allowed_origins() -> list[str]:
     raw = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000,http://localhost:8000,http://127.0.0.1:8000")
@@ -60,6 +70,19 @@ class ChatMessage(Base):
     role = Column(String(20), nullable=False)
     content = Column(Text, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class ReservationLike(Base):
+    __tablename__ = "user_reservation_likes"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    reservation_id = Column(Integer, ForeignKey("reservations.id"), nullable=False, index=True)
+    liked_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    source = Column(String(30), default="button", nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "reservation_id", name="uq_user_reservation_like"),
+    )
 
 
 Base.metadata.create_all(bind=engine)
@@ -254,6 +277,72 @@ async def health():
     return {"status": "ok"}
 
 
+@app.get("/google/status")
+async def google_status():
+    return google_tools_status()
+
+
+@app.get("/google/connect")
+async def google_connect():
+    config = google_tools_status()
+    if not config["ready"]["oauth"]:
+        return {
+            "status": "not_configured",
+            "message": "GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REDIRECT_URI를 설정해야 OAuth 연결을 시작할 수 있습니다.",
+        }
+
+    client_id = os.getenv("GOOGLE_CLIENT_ID")
+    redirect_uri = os.getenv("GOOGLE_REDIRECT_URI")
+    scope = "https://www.googleapis.com/auth/drive.readonly https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/customsearch"
+    auth_url = (
+        "https://accounts.google.com/o/oauth2/v2/auth"
+        + f"?client_id={client_id}"
+        + f"&redirect_uri={redirect_uri}"
+        + "&response_type=code"
+        + "&scope=" + "%20".join(scope.split())
+        + "&access_type=offline"
+        + "&prompt=consent"
+    )
+    return {"status": "ok", "oauth_url": auth_url}
+
+
+@app.get("/google/callback")
+async def google_callback(request: Request, code: str | None = None):
+    if not code:
+        raise HTTPException(status_code=400, detail="Google OAuth code가 없습니다.")
+
+    client_id = os.getenv("GOOGLE_CLIENT_ID")
+    client_secret = os.getenv("GOOGLE_CLIENT_SECRET")
+    redirect_uri = os.getenv("GOOGLE_REDIRECT_URI")
+    if not client_id or not client_secret or not redirect_uri:
+        raise HTTPException(status_code=500, detail="Google OAuth 환경 변수가 설정되지 않았습니다.")
+
+    payload = {
+        "code": code,
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "redirect_uri": redirect_uri,
+        "grant_type": "authorization_code",
+    }
+
+    try:
+        response = requests.post(
+            "https://oauth2.googleapis.com/token",
+            data=payload,
+            timeout=20,
+        )
+        response.raise_for_status()
+        token_json = response.json()
+        access_token = token_json.get("access_token")
+        if access_token:
+            redirect = RedirectResponse(url="/", status_code=302)
+            redirect.set_cookie("google_access_token", access_token, httponly=True, samesite="lax")
+            return redirect
+        return {"status": "error", "detail": "Google 토큰을 받지 못했습니다.", "raw": token_json}
+    except requests.RequestException as exc:
+        raise HTTPException(status_code=502, detail=f"Google OAuth 토큰 교환 실패: {exc}") from exc
+
+
 @app.post("/signup")
 async def signup(payload: dict):
     name = (payload or {}).get("name", "").strip()
@@ -344,6 +433,141 @@ async def get_reservations(request: Request):
                 for r in rows
             ]
         }
+    finally:
+        db.close()
+
+
+@app.get("/reservations/recommendations")
+async def get_recommendations(request: Request):
+    user_id = get_current_user_id(request)
+    db = SessionLocal()
+    try:
+        liked_rows = db.query(ReservationLike, Reservation).join(Reservation, Reservation.id == ReservationLike.reservation_id).filter(
+            ReservationLike.user_id == user_id
+        ).order_by(ReservationLike.liked_at.desc()).all()
+
+        liked_reservations = [
+            {
+                "id": row.Reservation.id,
+                "title": row.Reservation.title,
+                "note": row.Reservation.note,
+                "reservation_datetime": row.Reservation.reservation_datetime.isoformat() if row.Reservation.reservation_datetime else None,
+                "status": row.Reservation.status,
+                "liked_at": row.ReservationLike.liked_at.isoformat() if row.ReservationLike.liked_at else None,
+            }
+            for row in liked_rows
+        ]
+
+        candidate_rows = db.query(Reservation).filter(Reservation.user_id == user_id).order_by(Reservation.reservation_datetime.asc()).all()
+        candidate_reservations = [
+            {
+                "id": r.id,
+                "title": r.title,
+                "note": r.note,
+                "reservation_datetime": r.reservation_datetime.isoformat() if r.reservation_datetime else None,
+                "status": r.status,
+            }
+            for r in candidate_rows
+        ]
+
+        liked_ids = {reservation["id"] for reservation in liked_reservations}
+        scored = rank_reservations_for_user(liked_reservations, candidate_reservations)
+        recommendations = []
+        for item in scored:
+            reservation = item["reservation"]
+            reasons = []
+            if item["score"] >= 0.6:
+                reasons.append("높은 선호도")
+            if reservation.get("reservation_datetime"):
+                reasons.append("시간대 선호")
+            if reasons == []:
+                reasons.append("일반 추천")
+
+            recommendations.append({
+                "id": reservation["id"],
+                "title": reservation["title"],
+                "note": reservation["note"],
+                "reservation_datetime": reservation.get("reservation_datetime"),
+                "status": reservation.get("status"),
+                "score": float(item["score"]),
+                "liked": reservation["id"] in liked_ids,
+                "reasons": reasons,
+            })
+
+        return {"reservations": recommendations}
+    finally:
+        db.close()
+
+
+@app.get("/recommendations/weights/prompt")
+async def get_ai_weight_prompt():
+    return {
+        "prompt": """
+너는 추천 시스템 엔지니어다.
+
+아래는 사용자 예약 좋아요 데이터와 추천 로직의 설명이다.
+- 데이터는 사용자가 좋아요 누른 예약 목록이다.
+- 추천 알고리즘은 content-based filtering 기반이다.
+- 각 예약은 title, note, reservation_datetime, category, time_bucket를 가진다.
+- 계산 점수는 text_similarity, category_match, time_match, recency_bonus를 사용한다.
+
+현재 기본 가중치는:
+{
+  "text_similarity": 0.45,
+  "category_match": 0.25,
+  "time_match": 0.20,
+  "recency_bonus": 0.10
+}
+
+작업:
+1. 좋아요 데이터의 의미를 분석해라.
+2. 사용자 선호 키워드와 시간대 패턴을 정리해라.
+3. 추천 점수 가중치를 조정할 수 있는 개선안 3개를 제안해라.
+4. 전처리 규칙에서 누락된 동의어/카테고리 정리를 제안해라.
+5. 최종 결과는 JSON으로만 반환해라.
+6. 수정은 embaded/algorithm.py 안에서 가능한 함수에 한정해라.
+7. 코드는 다른 파일을 건드리지 마라.
+
+출력 format:
+{
+  "suggested_weights": {...},
+  "preprocessing_rules": [...],
+  "reasoning": "..."
+}
+        """.strip()
+    }
+
+
+@app.post("/reservations/{reservation_id}/like")
+async def like_reservation(request: Request, reservation_id: int):
+    user_id = get_current_user_id(request)
+    db = SessionLocal()
+    try:
+        reservation = db.query(Reservation).filter(Reservation.id == reservation_id, Reservation.user_id == user_id).first()
+        if not reservation:
+            raise HTTPException(status_code=404, detail="예약을 찾을 수 없습니다.")
+
+        like = db.query(ReservationLike).filter(ReservationLike.user_id == user_id, ReservationLike.reservation_id == reservation_id).first()
+        if like:
+            return {"ok": True, "liked": True, "reservation_id": reservation_id}
+
+        db.add(ReservationLike(user_id=user_id, reservation_id=reservation_id, source="button"))
+        db.commit()
+        return {"ok": True, "liked": True, "reservation_id": reservation_id}
+    finally:
+        db.close()
+
+
+@app.delete("/reservations/{reservation_id}/like")
+async def unlike_reservation(request: Request, reservation_id: int):
+    user_id = get_current_user_id(request)
+    db = SessionLocal()
+    try:
+        like = db.query(ReservationLike).filter(ReservationLike.user_id == user_id, ReservationLike.reservation_id == reservation_id).first()
+        if like:
+            db.delete(like)
+            db.commit()
+        return {"ok": True, "liked": False, "reservation_id": reservation_id}
     finally:
         db.close()
 
@@ -506,16 +730,196 @@ async def chat(request: Request, payload: dict):
     return {"message": message, "reply": reply_text}
 
 
+def serialize_reservation_row(row):
+    return {
+        "id": row.id,
+        "title": row.title,
+        "note": row.note,
+        "reservation_datetime": row.reservation_datetime.isoformat() if row.reservation_datetime else None,
+        "status": row.status,
+    }
+
+
 @app.post("/mcp")
-async def mcp(payload: dict):
+async def mcp(request: Request):
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="MCP payload must be an object")
+
     method = payload.get("method")
+    if method == "initialize":
+        return {
+            "jsonrpc": "2.0",
+            "id": payload.get("id", "initialize"),
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "linkchain-mcp", "version": "1.0.0"},
+            },
+        }
+
+    if method == "tools/list":
+        from embaded.mcp import list_mcp_tools
+        return {
+            "jsonrpc": "2.0",
+            "id": payload.get("id", "tools/list"),
+            "result": list_mcp_tools(),
+        }
+
     if method == "tools/call":
         params = payload.get("params", {})
-        arguments = params.get("arguments", {})
-        question = arguments.get("question") or arguments.get("text") or arguments.get("query")
-        if not question:
-            raise HTTPException(status_code=400, detail="question text is required")
-        return build_mcp_response(question)
+        if not isinstance(params, dict):
+            raise HTTPException(status_code=400, detail="params must be an object")
+
+        tool_name = params.get("name")
+        arguments = params.get("arguments", {}) or {}
+        if not isinstance(arguments, dict):
+            raise HTTPException(status_code=400, detail="arguments must be an object")
+
+        user_id = get_current_user_id(request)
+        db = SessionLocal()
+        try:
+            if tool_name == "search_knowledge":
+                question = arguments.get("question") or arguments.get("text") or arguments.get("query")
+                if not question:
+                    raise HTTPException(status_code=400, detail="question text is required")
+                return build_mcp_response(question, k=int(arguments.get("k", 3)))
+
+            if tool_name == "google_search":
+                query = arguments.get("query") or arguments.get("text")
+                if not query:
+                    raise HTTPException(status_code=400, detail="query is required")
+                return {
+                    "jsonrpc": "2.0",
+                    "id": payload.get("id", tool_name),
+                    "result": {
+                        "content": [{"type": "text", "text": json.dumps(google_search(query, num=int(arguments.get("num", 5))), ensure_ascii=False)}],
+                        "structuredContent": google_search(query, num=int(arguments.get("num", 5))),
+                        "isError": False,
+                    },
+                }
+
+            if tool_name == "google_drive_list":
+                access_token = arguments.get("access_token") or request.cookies.get("google_access_token")
+                result = google_drive_list(access_token=access_token, folder_id=arguments.get("folder_id"), page_size=int(arguments.get("page_size", 10)))
+                return {
+                    "jsonrpc": "2.0",
+                    "id": payload.get("id", tool_name),
+                    "result": {
+                        "content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False)}],
+                        "structuredContent": result,
+                        "isError": False,
+                    },
+                }
+
+            if tool_name == "google_drive_search":
+                access_token = arguments.get("access_token") or request.cookies.get("google_access_token")
+                query = arguments.get("query")
+                if not query:
+                    raise HTTPException(status_code=400, detail="query is required")
+                result = google_drive_search(access_token=access_token, query=query, page_size=int(arguments.get("page_size", 10)))
+                return {
+                    "jsonrpc": "2.0",
+                    "id": payload.get("id", tool_name),
+                    "result": {
+                        "content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False)}],
+                        "structuredContent": result,
+                        "isError": False,
+                    },
+                }
+
+            if tool_name == "gmail_list_recent":
+                access_token = arguments.get("access_token") or request.cookies.get("google_access_token")
+                result = gmail_list_recent(access_token=access_token, max_results=int(arguments.get("max_results", 5)))
+                return {
+                    "jsonrpc": "2.0",
+                    "id": payload.get("id", tool_name),
+                    "result": {
+                        "content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False)}],
+                        "structuredContent": result,
+                        "isError": False,
+                    },
+                }
+
+            if tool_name == "gmail_get_message":
+                access_token = arguments.get("access_token") or request.cookies.get("google_access_token")
+                message_id = arguments.get("message_id")
+                if not message_id:
+                    raise HTTPException(status_code=400, detail="message_id is required")
+                result = gmail_get_message(access_token=access_token, message_id=message_id)
+                return {
+                    "jsonrpc": "2.0",
+                    "id": payload.get("id", tool_name),
+                    "result": {
+                        "content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False)}],
+                        "structuredContent": result,
+                        "isError": False,
+                    },
+                }
+
+            if tool_name == "get_my_reservations":
+                rows = db.query(Reservation).filter(Reservation.user_id == user_id).order_by(Reservation.reservation_datetime.asc()).all()
+                reservations = [serialize_reservation_row(row) for row in rows]
+                return {
+                    "jsonrpc": "2.0",
+                    "id": payload.get("id", tool_name),
+                    "result": {
+                        "content": [{"type": "text", "text": json.dumps({"reservations": reservations}, ensure_ascii=False)}],
+                        "structuredContent": {"reservations": reservations},
+                        "isError": False,
+                    },
+                }
+
+            if tool_name == "create_reservation":
+                title = str(arguments.get("title", "")).strip() or "새 예약"
+                note = arguments.get("note") or ""
+                reservation_datetime_raw = arguments.get("reservation_datetime")
+                if not reservation_datetime_raw:
+                    raise HTTPException(status_code=400, detail="reservation_datetime is required")
+                try:
+                    reservation_datetime = datetime.fromisoformat(str(reservation_datetime_raw))
+                except ValueError as exc:
+                    raise HTTPException(status_code=400, detail="reservation_datetime 형식이 잘못되었습니다.") from exc
+
+                reservation = Reservation(user_id=user_id, title=title, note=str(note), reservation_datetime=reservation_datetime, status="pending")
+                db.add(reservation)
+                db.commit()
+                db.refresh(reservation)
+                payload_data = {"reservation": serialize_reservation_row(reservation)}
+                return {
+                    "jsonrpc": "2.0",
+                    "id": payload.get("id", tool_name),
+                    "result": {
+                        "content": [{"type": "text", "text": json.dumps(payload_data, ensure_ascii=False)}],
+                        "structuredContent": payload_data,
+                        "isError": False,
+                    },
+                }
+
+            if tool_name == "delete_reservation":
+                reservation_id = int(arguments.get("reservation_id"))
+                reservation = db.query(Reservation).filter(Reservation.id == reservation_id, Reservation.user_id == user_id).first()
+                if not reservation:
+                    raise HTTPException(status_code=404, detail="예약을 찾을 수 없습니다.")
+                db.delete(reservation)
+                db.commit()
+                return {
+                    "jsonrpc": "2.0",
+                    "id": payload.get("id", tool_name),
+                    "result": {
+                        "content": [{"type": "text", "text": json.dumps({"deleted_id": reservation_id}, ensure_ascii=False)}],
+                        "structuredContent": {"deleted_id": reservation_id},
+                        "isError": False,
+                    },
+                }
+
+            raise HTTPException(status_code=404, detail=f"Unsupported MCP tool: {tool_name}")
+        finally:
+            db.close()
 
     if "question" in payload:
         return build_mcp_response(payload["question"])
