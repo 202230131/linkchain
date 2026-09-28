@@ -1,0 +1,396 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8" />
+    <title>LinkChain Personal Assistant</title>
+    <style>
+        * { box-sizing: border-box; }
+        body { margin: 0; font-family: Arial, sans-serif; background: #f3f4f6; color: #111827; }
+        .layout { display: flex; min-height: 100vh; }
+        .sidebar { width: 320px; background: #111827; color: white; padding: 20px; }
+        .sidebar h2 { margin-top: 0; }
+        .reservation-list { list-style: none; margin: 16px 0 0; padding: 0; }
+        .reservation-item { background: rgba(255,255,255,0.08); border-radius: 8px; padding: 12px; margin-bottom: 10px; }
+        .reservation-item strong { display: block; margin-bottom: 6px; }
+        .reservation-meta { font-size: 12px; color: #d1d5db; margin-top: 6px; }
+        .reservation-actions { display: flex; gap: 8px; margin-top: 8px; }
+        .reservation-actions button { padding: 6px 8px; font-size: 12px; }
+        .main { flex: 1; padding: 20px; }
+        .auth-box, .dashboard-box { max-width: 980px; margin: 0 auto; }
+        .auth-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+        .card { background: white; border-radius: 12px; padding: 20px; box-shadow: 0 2px 8px rgba(0,0,0,0.06); }
+        .card h3 { margin-top: 0; }
+        label { display: block; margin-bottom: 10px; font-weight: 600; }
+        input, textarea { width: 100%; padding: 10px; margin-top: 5px; border: 1px solid #d1d5db; border-radius: 8px; }
+        button { padding: 10px 16px; border: none; border-radius: 8px; cursor: pointer; background: #2563eb; color: white; }
+        .toggle { display: flex; gap: 10px; margin-bottom: 16px; }
+        .toggle button { background: #e5e7eb; color: #111827; }
+        .toggle button.active { background: #2563eb; color: white; }
+        .chat-panel, .reservation-panel { display: none; }
+        .chat-panel.active, .reservation-panel.active { display: block; }
+        .messages { min-height: 220px; max-height: 360px; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; margin-bottom: 18px; }
+        .msg { padding: 12px 14px; border-radius: 10px; max-width: 80%; }
+        .msg.user { align-self: flex-end; background: #2563eb; color: white; }
+        .msg.bot { align-self: flex-start; background: #eef2ff; color: #111827; }
+        .hidden { display: none; }
+    </style>
+</head>
+<body>
+    <div id="authPage" class="auth-box">
+        <h1>LinkChain Personal Assistant</h1>
+        <div class="auth-grid">
+            <div class="card">
+                <h3>회원가입</h3>
+                <form id="signupForm">
+                    <label>이름<input name="name" required /></label>
+                    <label>이메일<input name="email" type="email" required /></label>
+                    <label>비밀번호<input name="password" type="password" required /></label>
+                    <button type="submit">가입하기</button>
+                </form>
+            </div>
+            <div class="card">
+                <h3>로그인</h3>
+                <form id="loginForm">
+                    <label>이메일<input name="email" type="email" required /></label>
+                    <label>비밀번호<input name="password" type="password" required /></label>
+                    <button type="submit">로그인</button>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <div id="appPage" class="layout hidden">
+        <aside class="sidebar">
+            <h2>예약 내역</h2>
+            <ul id="reservationList" class="reservation-list"></ul>
+            <button id="logoutBtn" style="margin-top: 20px;">로그아웃</button>
+        </aside>
+
+        <main class="main">
+            <div class="dashboard-box">
+                <h1 id="welcomeText">환영합니다</h1>
+
+                <div class="toggle">
+                    <button type="button" class="active" data-tab="chat">대화</button>
+                    <button type="button" data-tab="reservation">예약</button>
+                </div>
+
+                <div id="chatPanel" class="chat-panel active">
+                    <div id="chatMessages" class="messages">
+                        <div class="msg bot">안녕하세요. 무엇을 도와드릴까요?</div>
+                    </div>
+                    <form id="chatForm">
+                        <textarea id="chatInput" placeholder="메시지를 입력하세요"></textarea>
+                        <br /><br />
+                        <button type="submit">전송</button>
+                    </form>
+                </div>
+
+                <div id="reservationPanel" class="reservation-panel">
+                    <form id="reservationForm">
+                        <label>예약 제목<input name="title" required /></label>
+                        <label>예약 날짜<input name="date" type="date" required /></label>
+                        <label>예약 시간<input name="time" type="time" required /></label>
+                        <label>메모<textarea name="note" rows="3"></textarea></label>
+                        <button type="submit">예약하기</button>
+                    </form>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <script>
+        const authPage = document.getElementById('authPage');
+        const appPage = document.getElementById('appPage');
+        const welcomeText = document.getElementById('welcomeText');
+        const reservationList = document.getElementById('reservationList');
+        const chatMessages = document.getElementById('chatMessages');
+
+        function showAuth() {
+            authPage.classList.remove('hidden');
+            appPage.classList.add('hidden');
+        }
+
+        function showApp() {
+            authPage.classList.add('hidden');
+            appPage.classList.remove('hidden');
+        }
+
+        let currentEditReservationId = null;
+
+        function setUser(user) {
+            welcomeText.textContent = `${user.name}님, 안녕하세요.`;
+            showApp();
+            loadReservations();
+            loadChatHistory();
+        }
+
+        function addChatMessage(role, text) {
+            const div = document.createElement('div');
+            div.className = 'msg ' + role;
+            div.textContent = text;
+            chatMessages.appendChild(div);
+            chatMessages.scrollTop = chatMessages.scrollHeight;
+        }
+
+        async function loadChatHistory() {
+            try {
+                const response = await fetch('/chat/history', { credentials: 'same-origin' });
+                if (!response.ok) return;
+                const data = await response.json();
+                chatMessages.innerHTML = '';
+                if (!data.messages || data.messages.length === 0) {
+                    chatMessages.innerHTML = '<div class="msg bot">안녕하세요. 무엇을 도와드릴까요?</div>';
+                    return;
+                }
+                data.messages.forEach((message) => {
+                    addChatMessage(message.role === 'user' ? 'user' : 'bot', message.content);
+                });
+            } catch (error) {
+                console.error(error);
+            }
+        }
+
+        async function loadUser() {
+            try {
+                const response = await fetch('/me', { credentials: 'same-origin' });
+                if (!response.ok) {
+                    showAuth();
+                    return;
+                }
+                const user = await response.json();
+                setUser(user);
+            } catch {
+                showAuth();
+            }
+        }
+
+        function formatCountdown(dateValue) {
+            const target = new Date(dateValue).getTime();
+            const now = Date.now();
+            const diffMs = target - now;
+            if (diffMs <= 0) {
+                return '마감';
+            }
+            const totalMinutes = Math.floor(diffMs / 60000);
+            const d = Math.floor(totalMinutes / (24 * 60));
+            const h = Math.floor((totalMinutes % (24 * 60)) / 60);
+            const m = totalMinutes % 60;
+            if (d > 0) return `${d}일 ${h}시간 ${m}분 남음`;
+            if (h > 0) return `${h}시간 ${m}분 남음`;
+            return `${m}분 남음`;
+        }
+
+        function refreshCountdowns() {
+            document.querySelectorAll('.reservation-item .reservation-meta').forEach((meta) => {
+                const itemId = Number(meta.dataset.id);
+                const reservation = (window.__reservationData || []).find((entry) => entry.id === itemId);
+                if (!reservation) return;
+                meta.textContent = `상태: ${reservation.status} · ${formatCountdown(reservation.reservation_datetime)}`;
+            });
+        }
+
+        async function loadReservations() {
+            try {
+                const response = await fetch('/reservations', { credentials: 'same-origin' });
+                if (!response.ok) {
+                    return;
+                }
+                const data = await response.json();
+                window.__reservationData = data.reservations || [];
+                reservationList.innerHTML = '';
+                if (!data.reservations || data.reservations.length === 0) {
+                    reservationList.innerHTML = '<li class="reservation-item">예약이 없습니다.</li>';
+                    return;
+                }
+
+                data.reservations.forEach((item) => {
+                    const li = document.createElement('li');
+                    li.className = 'reservation-item';
+                    const dt = new Date(item.reservation_datetime);
+                    li.innerHTML = `
+                        <strong>${item.title}</strong>
+                        <div>${dt.toLocaleString('ko-KR')}</div>
+                        <div class="reservation-meta" data-id="${item.id}">상태: ${item.status} · ${formatCountdown(item.reservation_datetime)}</div>
+                        <div class="reservation-actions">
+                            <button type="button" data-action="edit" data-id="${item.id}">수정</button>
+                            <button type="button" data-action="delete" data-id="${item.id}">삭제</button>
+                        </div>
+                    `;
+                    reservationList.appendChild(li);
+                });
+
+                reservationList.querySelectorAll('[data-action="edit"]').forEach((button) => {
+                    button.addEventListener('click', async () => {
+                        const id = Number(button.dataset.id);
+                        const target = (window.__reservationData || []).find((item) => item.id === id);
+                        if (!target) return;
+
+                        const form = document.getElementById('reservationForm');
+                        const formElements = form.elements;
+                        const dt = new Date(target.reservation_datetime);
+                        formElements.namedItem('title').value = target.title;
+                        formElements.namedItem('note').value = target.note || '';
+                        formElements.namedItem('date').value = dt.toISOString().slice(0, 10);
+                        formElements.namedItem('time').value = dt.toTimeString().slice(0, 5);
+                        currentEditReservationId = id;
+                        form.querySelector('button[type="submit"]').textContent = '수정 완료';
+                    });
+                });
+
+                reservationList.querySelectorAll('[data-action="delete"]').forEach((button) => {
+                    button.addEventListener('click', async () => {
+                        const id = Number(button.dataset.id);
+                        const response = await fetch(`/reservations/${id}`, {
+                            method: 'DELETE',
+                            credentials: 'same-origin'
+                        });
+                        if (response.ok) {
+                            loadReservations();
+                        }
+                    });
+                });
+
+                refreshCountdowns();
+            } catch (error) {
+                console.error(error);
+            }
+        }
+
+        document.getElementById('signupForm').addEventListener('submit', async (event) => {
+            event.preventDefault();
+            const form = event.target;
+            const payload = Object.fromEntries(new FormData(form).entries());
+            const response = await fetch('/signup', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload),
+                credentials: 'same-origin'
+            });
+            const data = await response.json();
+            if (!response.ok) {
+                alert(data.detail || '회원가입 실패');
+                return;
+            }
+            alert('회원가입 완료! 로그인해 주세요.');
+            form.reset();
+        });
+
+        document.getElementById('loginForm').addEventListener('submit', async (event) => {
+            event.preventDefault();
+            const form = event.target;
+            const payload = Object.fromEntries(new FormData(form).entries());
+            const response = await fetch('/login', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload),
+                credentials: 'same-origin'
+            });
+            const data = await response.json();
+            if (!response.ok) {
+                alert(data.detail || '로그인 실패');
+                return;
+            }
+            setUser(data);
+            form.reset();
+        });
+
+        document.getElementById('logoutBtn').addEventListener('click', async () => {
+            await fetch('/logout', { method: 'POST', credentials: 'same-origin' });
+            showAuth();
+        });
+
+        document.querySelectorAll('[data-tab]').forEach((button) => {
+            button.addEventListener('click', () => {
+                const tab = button.dataset.tab;
+                document.querySelectorAll('[data-tab]').forEach((btn) => btn.classList.toggle('active', btn === button));
+                const chatPanel = document.getElementById('chatPanel');
+                const reservationPanel = document.getElementById('reservationPanel');
+                chatPanel.classList.toggle('active', tab === 'chat');
+                reservationPanel.classList.toggle('active', tab === 'reservation');
+            });
+        });
+
+        document.getElementById('chatForm').addEventListener('submit', async (event) => {
+            event.preventDefault();
+            const text = document.getElementById('chatInput').value.trim();
+            if (!text) return;
+            addChatMessage('user', text);
+            document.getElementById('chatInput').value = '';
+            try {
+                const response = await fetch('/chat', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ message: text }),
+                    credentials: 'same-origin'
+                });
+                const data = await response.json();
+                if (!response.ok) {
+                    addChatMessage('bot', data.detail || '오류가 발생했습니다.');
+                    return;
+                }
+                if (data.reservation) {
+                    await loadReservations();
+                }
+                addChatMessage('bot', typeof data.reply === 'string' ? data.reply : JSON.stringify(data.reply));
+            } catch (error) {
+                addChatMessage('bot', '오류: ' + error.message);
+            }
+        });
+
+        document.getElementById('reservationForm').addEventListener('submit', async (event) => {
+            event.preventDefault();
+            const form = event.target;
+            const formData = Object.fromEntries(new FormData(form).entries());
+            const date = formData.date;
+            const time = formData.time;
+            const payload = {
+                title: formData.title,
+                note: formData.note || '',
+                reservation_datetime: `${date}T${time}:00`
+            };
+
+            const submitButton = form.querySelector('button[type="submit"]');
+            let response;
+            let actionText = '예약이 등록되었습니다';
+            if (currentEditReservationId) {
+                actionText = '예약이 수정되었습니다';
+                response = await fetch(`/reservations/${currentEditReservationId}`, {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload),
+                    credentials: 'same-origin'
+                });
+            } else {
+                response = await fetch('/reservations', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload),
+                    credentials: 'same-origin'
+                });
+            }
+
+            const data = await response.json();
+            if (!response.ok) {
+                alert(data.detail || '예약 처리 실패');
+                return;
+            }
+            form.reset();
+            const previousEdit = currentEditReservationId;
+            currentEditReservationId = null;
+            submitButton.textContent = '예약하기';
+            loadReservations();
+            addChatMessage('bot', `${actionText}: ${data.title} (${data.reservation_datetime})`);
+            if (previousEdit !== null) {
+                addChatMessage('bot', '예약이 수정 완료되었습니다.');
+            }
+        });
+
+        setInterval(() => {
+            refreshCountdowns();
+        }, 60000);
+
+        loadUser();
+    </script>
+</body>
+</html>

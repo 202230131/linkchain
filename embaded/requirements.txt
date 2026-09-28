@@ -1,0 +1,6 @@
+python-dotenv
+google-genai
+langchain
+langchain-postgres
+fastapi
+uvicorn
